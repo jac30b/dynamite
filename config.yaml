@@ -1,0 +1,29 @@
+# Quorum configuration for the Dynamite distributed key-value store.
+#
+# This protocol has two key configurable values: R and W.
+# Setting R and W such that R + W > N yields a quorum-like system.
+# The latency of a get (or put) operation is dictated by the slowest
+# of the R (or W) replicas. For this reason, R and W are usually
+# configured to be less than N, to provide better latency.
+# cc: https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf
+# N - Replication factor
+# The total number of nodes that each key-value pair is replicated to.
+replication_factor: 3
+
+# R - The minimum number of nodes that must participate
+# in a successful read operation.
+read_quorum: 2
+
+# W - The minimum number of nodes that must participate
+# in a successful write operation.
+write_quorum: 2
+
+# Self - The identity of this node. Must match one of the nodes below.
+self: node1
+
+# Nodes - The list of nodes in the cluster.
+# The replication factor (N) must not exceed the number of nodes.
+nodes:
+  - node1
+  - node2
+  - node3
