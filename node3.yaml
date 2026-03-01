@@ -1,0 +1,8 @@
+replication_factor: 3
+read_quorum: 2
+write_quorum: 2
+self: localhost:8083
+nodes:
+  - localhost:8081
+  - localhost:8082
+  - localhost:8083

@@ -1,0 +1,125 @@
+# Dynamo: Amazon's Highly Available Key-Value Store
+
+This document summarizes the core concepts and control flows from the Amazon Dynamo paper. Since you're building this for a learning project, this overview focuses on *what* the system does and *how* data flows through it, leaving the exact implementation details (like the network layer or data serialization) up to you.
+
+## Core Problem
+Dynamo was built to provide a highly available, scalable, and always-writable key-value store. It prioritizes **Availability (A)** and **Partition Tolerance (P)** over strict **Consistency (C)** (from the CAP theorem), aiming instead for *eventual consistency*.
+
+## Key Architectural Techniques
+
+1. **Partitioning (Consistent Hashing):** Distributes data uniformly across a ring of nodes. Adding or removing nodes only affects immediate neighbors, minimizing data movement.
+2. **Replication:** Data is replicated to `N` different nodes (the "preference list") to ensure durability and availability.
+3. **Data Versioning (Vector Clocks):** Since writes can happen to different versions of the data during network partitions, Dynamo uses vector clocks to capture causality and detect conflicts.
+4. **Execution (Sloppy Quorum & Hinted Handoff):** Ensures that writes/reads can succeed even if some preferred replica nodes are down. The system temporarily writes to other healthy nodes with a "hint" to hand the data back when the original node recovers.
+5. **Anti-Entropy (Merkle Trees):** A background process used to detect and resolve inconsistencies between replicas efficiently, without needing to transfer entire datasets over the network.
+6. **Membership (Gossip Protocol):** Nodes discover each other and detect failures via a decentralized, peer-to-peer gossip communication protocol.
+
+## System Parameters (The N, R, W Model)
+Dynamo allows tuning consistency vs. performance using three key parameters:
+- **N:** Total number of replicas for a specific key.
+- **W:** Write quorum (minimum number of nodes that must acknowledge a write for it to be deemed successful).
+- **R:** Read quorum (minimum number of nodes that must respond to a read).
+
+*Rule of thumb for strong consistency:* `W + R > N` (e.g., N=3, W=2, R=2). 
+However, Dynamo often allows `W + R <= N` for even higher availability, embracing eventual consistency.
+
+---
+
+## Control Flow: Write Operation (`put(key, context, object)`)
+
+A write must succeed even under heavy failure conditions (creating an "always-writable" data store).
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant Coord as Coordinator Node
+    participant R1 as Replica 1
+    participant R2 as Replica 2
+    participant R3 as Replica down
+
+    C->>Coord: put(key, context, object)
+    Note over Coord: 1. Generate new Vector Clock<br/>2. Write data locally
+
+    Coord->>R1: Replicate (data + clock)
+    Coord->>R2: Replicate (data + clock)
+    Coord-xR3: Replicate (fails)
+    
+    Note over Coord: Wait for W acknowledgements<br/>(including local write)
+    
+    R1-->>Coord: ACK
+    R2-->>Coord: ACK
+    
+    Coord-->>C: Success Response
+```
+
+1. **Routing:** 
+   - The client sends the write request to a load balancer, which routes it to any node, OR the client is partition-aware and sends it directly to the **Coordinator Node** (typically the primary node for that key on the consistent hashing ring).
+2. **Versioning:**
+   - The Coordinator generates a new vector clock for the new version of the data (e.g., `[NodeA: 1]`).
+3. **Local Write:**
+   - The Coordinator writes the new version of the data locally.
+4. **Replication (Sloppy Quorum):**
+   - The Coordinator sends the new data and vector clock to the top `N` reachable nodes in its preference list.
+   - *Hinted Handoff feature:* If a designated healthy replica is down, the Coordinator will pick the next healthy node further down the ring to temporarily store the data (along with a hint about who it actually belongs to).
+5. **Waiting for Acknowledgement:**
+   - The Coordinator waits for `W - 1` successful responses from the replicas (plus its own local write, making it `W` total).
+6. **Success:**
+   - Once `W` nodes have acknowledged the write, the Coordinator returns a success response to the client.
+
+---
+
+## Control Flow: Read Operation (`get(key)`)
+
+A read operation might return multiple conflicting versions if network partitions or concurrent writes have occurred.
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant Coord as Coordinator Node
+    participant R1 as Replica 1
+    participant R2 as Replica 2
+    participant R3 as Replica 3
+
+    C->>Coord: get(key)
+    Coord->>R1: Request data 
+    Coord->>R2: Request data
+    Coord->>R3: Request data
+
+    R1-->>Coord: Returns data (Version A)
+    R2-->>Coord: Returns data (Version B)
+    
+    Note over Coord: Wait for R responses<br/>(e.g. R=2)
+    
+    alt Causally related (e.g. A newer than B)
+        Coord-->>C: Returns latest Version A
+    else Causally unrelated (Conflict)
+        Coord-->>C: Returns multiple conflicting versions
+        Note over C: Application merges conflicts
+        C->>Coord: put(key, merged_context, merged_object)
+    end
+```
+
+1. **Routing:**
+   - Similar to writes, the read request is routed to a **Coordinator Node**.
+2. **Requesting Data:**
+   - The Coordinator requests the data for the given key from the top `N` reachable nodes in the preference list for that key.
+3. **Waiting for Responses:**
+   - The Coordinator waits for `R` responses to fulfill the read quorum.
+4. **Reconciliation:**
+   - **Case A (No Conflict):** If all `R` nodes return the exact same version, or if the versions form a single causal chain (one strictly newer than another), the latest version is returned to the client.
+   - **Case B (Conflict):** If multiple nodes return causally unrelated versions (concurrent writes detected via vector clocks), the Coordinator returns *all* conflicting versions to the client.
+5. **Client Conflict Resolution:**
+   - It is the **client application's responsibility** to resolve the conflict (e.g., an e-commerce app merging two diverging shopping carts).
+   - After merging, the client performs a new `put()` with the newly merged data to update the system and establish a new causal timeline.
+6. **Read Repair (Optimization):**
+   - If the Coordinator notices that some nodes returned older versions compared to others during the `get()`, it can asynchronously send the newest version back to those out-of-date nodes to bring them up to speed.
+
+---
+
+## Control Flow: Background Processes
+
+If you are building a complete system, you will eventually want to implement these background loops:
+
+- **Hinted Handoff Delivery:** Nodes periodically check if the original target nodes for "hinted" data are back online. If so, they forward the data over and delete their temporary local copy.
+- **Anti-Entropy Sync:** Nodes continuously exchange Merkle trees (a tree of hashes mapping to data ranges) to quickly figure out if they are missing any data compared to their peers. They then transfer only the missing parts.
+- **Gossip:** Every second, a node contacts a random peer to share its view of the cluster membership and node health. This is how everyone agrees on the structure of the "ring" without a central coordinator.
